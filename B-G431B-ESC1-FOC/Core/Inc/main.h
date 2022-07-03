@@ -34,6 +34,7 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "math_util.h"
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -61,6 +62,10 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define ADC1_VBUS_Pin GPIO_PIN_0
+#define ADC1_VBUS_GPIO_Port GPIOA
+#define ADC1_POT_Pin GPIO_PIN_12
+#define ADC1_POT_GPIO_Port GPIOB
 #define GPIO_LED_Pin GPIO_PIN_6
 #define GPIO_LED_GPIO_Port GPIOC
 #define GPIO_BUTTON_Pin GPIO_PIN_10

@@ -51,17 +51,53 @@ OPAMP_HandleTypeDef hopamp2;
 OPAMP_HandleTypeDef hopamp3;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
-uint16_t adc1_dma_data[2];
+const uint16_t ADC_RESOLUTION = 4096;
+//const float ADC_OPAMP_CURRENT_COEFFICIENT = 0.00357; // convert ADC bits to Amps
+const float ADC_OPAMP_CURRENT_COEFFICIENT = 0.004; // convert ADC bits to Amps
+
+uint16_t adc1_dma_data[3];
 uint16_t adc2_dma_data[2];
-float motor_current_input_adc[3];
+uint16_t adc_opamp_current_offset[3];
+
+uint32_t dt;
+
+uint16_t counter;
+
+int8_t n_pole_pairs;
+int8_t motor_direction;
+
+float phase_current_measured[3];    // positive for going into phase, negative for going out of phase
+float i_q_filtered;
+float i_d_filtered;
+float v_q;
+float v_d;
+float v_alpha;
+float v_beta;
+float bus_voltage_measured;
+float phase_voltage_setpoint[3];
+
+float position_setpoint;
+float position_measured;
+float encoder_flux_angle_offset;
+
+float torque_setpoint;
+float flux_setpoint;
+
+
+
+// encoder variables
+float encoder_position_prev;
+int32_t encoder_n_rotations;
+
+
 float input_pot;
 
-uint8_t counter;
 
 /* USER CODE END PV */
 
@@ -77,75 +113,255 @@ static void MX_I2C1_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
+void logStat();
+float AS5600_getPosition();
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-float normalizeAngle(angle) {
-  angle = fmodf(angle, 2*M_PI);
-  return angle >= 0.0f ? angle : (angle + 2*M_PI);
-}
-
-
-float AS5600_getAngle() {
-  uint8_t buf[2];
-  HAL_I2C_Mem_Read(&hi2c1, 0b0110110<<1, 0x0E, I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
-  float angle = (((uint16_t)buf[0]) << 8) | buf[1];
-  return angle / 4096.;
-}
-
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   if (hadc == &hadc1) {
+    // phase current: positive for going into phase, negative for going out of phase
+    // shunt: when current flows inward phase, shunt voltage is negative; when current flows outward phase, shunt voltage is positive
+    // thus we put negative sign at phase current conversion.
     if(__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
-      motor_current_input_adc[0] = adc1_dma_data[0] / 4096.;
-      input_pot = adc1_dma_data[1] / 4096.;
+      phase_current_measured[0] = -(float)(adc1_dma_data[0] - adc_opamp_current_offset[0]) * ADC_OPAMP_CURRENT_COEFFICIENT;
+      bus_voltage_measured = adc1_dma_data[1] / (float)ADC_RESOLUTION * 3.3 * 10.39;
+      input_pot = adc1_dma_data[2] / (float)ADC_RESOLUTION;
     }
   }
   if (hadc == &hadc2) {
     if(__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
-      motor_current_input_adc[1] = adc2_dma_data[0] / 4096.;
-      motor_current_input_adc[2] = adc2_dma_data[1] / 4096.;
+      phase_current_measured[1] = -(float)(adc2_dma_data[0] - adc_opamp_current_offset[1]) * ADC_OPAMP_CURRENT_COEFFICIENT;
+      phase_current_measured[2] = -(float)(adc2_dma_data[1] - adc_opamp_current_offset[2]) * ADC_OPAMP_CURRENT_COEFFICIENT;
     }
   }
 }
 
-void invClark(float v_d, float v_q, float theta, float *v_alpha, float *v_beta) {
-  *v_alpha = -v_q * sinf(theta) + v_d * cosf(theta);
-  *v_beta = v_q * cosf(theta) + v_d * sinf(theta);
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim == &htim6) {
+
+    position_setpoint = input_pot * 2 * M_PI * 15;
+
+    float position_error = position_setpoint - position_measured;
+
+    float position_kp = 0.5; //30;
+
+    torque_setpoint = position_kp * position_error;
+
+    flux_setpoint = 0;
+
+    float maximum_current = 1;
+    torque_setpoint = clampf(torque_setpoint, -maximum_current, maximum_current);
+    flux_setpoint = clampf(flux_setpoint, -maximum_current, maximum_current);
+
+
+    counter += 1;
+    if (counter >= 400) {
+      logStat();
+      counter = 0;
+    }
+  }
 }
 
-void SPWM(float v_alpha, float v_beta) {
-  float v_a = v_alpha;
-  float v_b = (-0.5 * v_alpha) + ((sqrtf(3.0f)/2.) * v_beta);
-  float v_c = (-0.5 * v_alpha) - ((sqrtf(3.0f)/2.) * v_beta);
+
+float AS5600_getPosition() {
+  uint8_t buf[2];
+  HAL_I2C_Mem_Read(&hi2c1, 0b0110110<<1, 0x0E, I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
+
+  const uint16_t cpr = 4096;
+  uint16_t raw_angle = ((uint16_t)buf[0] << 8) | buf[1];
+  float position_relative = ((float)raw_angle / (float)cpr) * (2*M_PI);
+
+  float delta_position = position_relative - encoder_position_prev;
+
+  if (fabsf(delta_position) > 0.8 * (2*M_PI)) {
+    encoder_n_rotations += (delta_position > 0) ? -1 : 1;
+  }
+
+  encoder_position_prev = position_relative;
+
+  return position_relative + encoder_n_rotations * (2*M_PI);
+}
 
 
-  float current_bus_voltage = 100.0;
+void setBridgeOutput(uint8_t enabled, float a, float b, float c) {
+  if (!enabled) {
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+    return;
+  }
 
-  float v_neutral = .5f * (fmaxf(fmaxf(v_a, v_b), v_c) + fminf(fminf(v_a, v_b), v_c));
+  a = clampf(a, 0.0f, 0.98f);  // prevent hi-side switching bootstrap circuit loses voltage
+  b = clampf(b, 0.0f, 0.98f);
+  c = clampf(c, 0.0f, 0.98f);
 
-  float pwm_duty_cycle_a = (((v_a - v_neutral) / current_bus_voltage) + 1.f) * .5f;
-  float pwm_duty_cycle_b = (((v_b - v_neutral) / current_bus_voltage) + 1.f) * .5f;
-  float pwm_duty_cycle_c = (((v_c - v_neutral) / current_bus_voltage) + 1.f) * .5f;
-
-  pwm_duty_cycle_a = (pwm_duty_cycle_a > 1) ? 1 : ((pwm_duty_cycle_a < 0) ? 0 : pwm_duty_cycle_a);
-  pwm_duty_cycle_b = (pwm_duty_cycle_b > 1) ? 1 : ((pwm_duty_cycle_b < 0) ? 0 : pwm_duty_cycle_b);
-  pwm_duty_cycle_c = (pwm_duty_cycle_c > 1) ? 1 : ((pwm_duty_cycle_c < 0) ? 0 : pwm_duty_cycle_c);
-
-  uint16_t ccr_a = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * pwm_duty_cycle_a);
-  uint16_t ccr_b = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * pwm_duty_cycle_b);
-  uint16_t ccr_c = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * pwm_duty_cycle_c);
-
-  char str[128];
-  sprintf(str, "%d\t%d\t%d\r\n", ccr_a, ccr_b,ccr_c);
-  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
+  uint16_t ccr_a = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * a);
+  uint16_t ccr_b = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * b);
+  uint16_t ccr_c = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * c);
 
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_a);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_b);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr_c);
+}
+
+
+void FOC_generateInvClarkSVPWM(float v_q, float v_d, float theta) {
+  float v_alpha = -v_q * sinf(theta) + v_d * cosf(theta);
+  float v_beta = v_q * cosf(theta) + v_d * sinf(theta);
+  float v_a = v_alpha;
+  float v_b = (-0.5 * v_alpha) + ((sqrtf(3.0f)/2.) * v_beta);
+  float v_c = (-0.5 * v_alpha) - ((sqrtf(3.0f)/2.) * v_beta);
+
+  float v_neutral = .5f * (fmaxf(fmaxf(v_a, v_b), v_c) + fminf(fminf(v_a, v_b), v_c));
+
+  phase_voltage_setpoint[0] = v_a - v_neutral;
+  phase_voltage_setpoint[1] = v_b - v_neutral;
+  phase_voltage_setpoint[2] = v_c - v_neutral;
+
+  float pwm_duty_cycle_a = .5f * ((phase_voltage_setpoint[0] / bus_voltage_measured) + 1.f);
+  float pwm_duty_cycle_b = .5f * ((phase_voltage_setpoint[1] / bus_voltage_measured) + 1.f);
+  float pwm_duty_cycle_c = .5f * ((phase_voltage_setpoint[2] / bus_voltage_measured) + 1.f);
+
+  setBridgeOutput(1, pwm_duty_cycle_a, pwm_duty_cycle_b, pwm_duty_cycle_c);
+}
+
+/**
+ * set flux angle within one electrical revolution.
+ *
+ * @param angle_setpoint: the electrical revolution angle, in radian.
+ */
+void FOC_setFluxAngle(float angle_setpoint, float voltage_setpoint) {
+  float theta = wrapTo2Pi(angle_setpoint);
+  float v_q = 0.0f;
+  float v_d = clampf(voltage_setpoint, -2, 14);
+
+  FOC_generateInvClarkSVPWM(v_q, v_d, theta);
+}
+
+void FOC_runCalibrationSequence() {
+  // calibration sequence
+  HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_SET);
+
+  // get current offset
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+  HAL_Delay(500);
+
+  adc_opamp_current_offset[0] = adc1_dma_data[0];
+  adc_opamp_current_offset[1] = adc2_dma_data[0];
+  adc_opamp_current_offset[2] = adc2_dma_data[1];
+
+  {
+    char str[128];
+    sprintf(str, "phase current offset: %d\t%d\t%d\r\n", adc_opamp_current_offset[0], adc_opamp_current_offset[1], adc_opamp_current_offset[2]);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+  }
+
+  // open loop calibration
+  float flux_angle_setpoint = 0;
+  float voltage_setpoint = 1;
+
+  FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
+  HAL_Delay(500);
+
+  float start_position = AS5600_getPosition();
+
+  // move one electrical revolution forward
+  for (int16_t i=0; i<=500; i+=1) {
+    flux_angle_setpoint = (i / 500.0f) * (2*M_PI);
+    FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
+    HAL_Delay(2);
+  }
+  HAL_Delay(500);
+
+  float end_position = AS5600_getPosition();
+
+  for (int16_t i=500; i>=0; i-=1) {
+    flux_angle_setpoint = (i / 500.0f) * (2*M_PI);
+    FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
+    HAL_Delay(2);
+  }
+
+  flux_angle_setpoint = 0;
+  FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
+  HAL_Delay(500);
+
+  start_position = 0.5 * AS5600_getPosition() + 0.5 * start_position;
+  HAL_Delay(500);
+
+  // release motor
+  FOC_setFluxAngle(0, 0);
+
+
+  float delta_position = end_position - start_position;
+
+  {
+    char str[128];
+    sprintf(str, "initial encoder angle: %f\r\n", start_position);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+    sprintf(str, "end encoder angle: %f\r\n", end_position);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+    sprintf(str, "delta angle: %f\r\n", delta_position);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+  }
+
+
+  if (fabsf(delta_position) < 0.1) {
+    // motor did not rotate
+    HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor not rotating\r\n", strlen("ERROR: motor not rotating\r\n"), 10);
+  }
+
+  if (fabsf(fabsf(delta_position)*n_pole_pairs-(2*M_PI)) > 0.5f) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor pole pair mismatch\r\n", strlen("ERROR: motor pole pair mismatch\r\n"), 10);
+  }
+
+
+  // set electrical angle
+  encoder_flux_angle_offset = wrapTo2Pi(start_position * n_pole_pairs);
+
+  {
+    char str[128];
+    sprintf(str, "offset angle: %f\r\n", encoder_flux_angle_offset);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+  }
+
+  HAL_Delay(1000);
+
+  HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_RESET);
+}
+
+void FOC_updateTorque(float i_q_setpoint, float i_d_setpoint) {
+
+//  motor_current_mA[index]= -((float)motor_current_sample_adc[index]-motor_current_input_adc_offset[index])/motor_current_input_adc_mA[index];
+}
+
+uint8_t getUserButton() {
+  return HAL_GPIO_ReadPin(GPIO_BUTTON_GPIO_Port, GPIO_BUTTON_Pin) ? 0 : 1;
+}
+
+void logStat() {
+  char str[512];
+  sprintf(str, "%.3f\t%.3f\t%.3f\t%.3f\t%.1f\t%.5f\t%.5f\t%.5f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\r\n",
+      phase_current_measured[0],
+      phase_current_measured[1],
+      phase_current_measured[2],
+      position_measured,
+      bus_voltage_measured,
+      phase_voltage_setpoint[0],
+      phase_voltage_setpoint[1],
+      phase_voltage_setpoint[2],
+      i_q_filtered, i_d_filtered,
+      v_q, v_d,
+      torque_setpoint, flux_setpoint,
+      position_setpoint);
+  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
 }
 
 /* USER CODE END 0 */
@@ -187,6 +403,7 @@ int main(void)
   MX_DMA_Init();
   MX_ADC2_Init();
   MX_ADC1_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -196,7 +413,17 @@ int main(void)
 //  buffer[0] |= (0b10 << 4);
 //  HAL_I2C_Mem_Write(&hi2c1, 0b0110110<<1, 0x08, I2C_MEMADD_SIZE_8BIT, buffer, 1, 10);
 
+  n_pole_pairs = 14;
+  motor_direction = 1;
 
+  encoder_flux_angle_offset = 4.815159;
+
+  adc_opamp_current_offset[0] = 2485;
+  adc_opamp_current_offset[1] = 2463;
+  adc_opamp_current_offset[2] = 2484;
+
+
+  // initialize
 
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
@@ -215,8 +442,10 @@ int main(void)
   HAL_OPAMP_Start(&hopamp3);
 
 
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma_data, 2);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma_data, 3);
   HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma_data, 2);
+
+  HAL_TIM_Base_Start_IT(&htim6);
 
   // CORDIC init
 //  API_CORDIC_Processor_Init();
@@ -225,7 +454,13 @@ int main(void)
 //  __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_2,CCRb); // switch b and c phases
 //  __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_3,CCRc); // switch b and c phases
 
-  float angle_setpoint = 0;
+
+
+  position_setpoint = 0;
+  uint32_t prev_t = HAL_GetTick();
+
+
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -236,44 +471,77 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
+    if (getUserButton()) {
+      FOC_runCalibrationSequence();
+    }
 
 
-    float i_a = motor_current_input_adc[0];
-    float i_b = motor_current_input_adc[1];
-    float i_c = motor_current_input_adc[2];
+
+    position_measured = AS5600_getPosition();
+
+    float i_a = phase_current_measured[0];
+    float i_b = phase_current_measured[1];
+    float i_c = phase_current_measured[2];
 
     float i_alpha = i_a + (cosf((2./3.) * M_PI) * i_b) + (cosf((2./3.) * M_PI) * i_c);
     float i_beta = sinf((2./3.) * M_PI) * i_b - sinf((2./3.) * M_PI) * i_c;
 
+    i_alpha *= 2 / 3.;
+    i_beta *= 2 / 3.;
 
-    float theta = AS5600_getAngle() * 2 * M_PI;
 
-    theta = theta * 14;
+    float theta = wrapTo2Pi((position_measured * (float)n_pole_pairs) - encoder_flux_angle_offset);
 
-    theta = normalizeAngle(theta);
-
-    float i_d = i_alpha * cosf(theta) + i_beta * sinf(theta);
     float i_q = -i_alpha * sinf(theta) + i_beta * cosf(theta);
+    float i_d = i_alpha * cosf(theta) + i_beta * sinf(theta);
+
+    const float ALPHA = 0.5;
+
+    i_q_filtered = ALPHA * i_q + (1-ALPHA) * i_q_filtered;
+    i_d_filtered = ALPHA * i_d + (1-ALPHA) * i_d_filtered;
 
 
-    i_d += 0.1;
-    i_q += 0.1;
+    uint8_t closed_loop = 1;
+
+//    float i_q_setpoint = 0;
+//    float i_d_setpoint = 0.2;
+    float i_q_setpoint = torque_setpoint;
+    float i_d_setpoint = flux_setpoint;
+
+    float i_q_error = i_q_setpoint - (closed_loop ? i_q_filtered : 0);
+    float i_d_error = i_d_setpoint - (closed_loop ? i_d_filtered : 0);
+
+    float v_q_kp = 5;
+    float v_d_kp = 5;
+
+    v_q = i_q_error * v_q_kp;  // kp = 0.02
+    v_d = i_d_error * v_d_kp;
+
+    // clamp voltage
+    if (bus_voltage_measured > 0) {
+      float v_max_sq = bus_voltage_measured * bus_voltage_measured * 1.15; // CSVPWM over modulation
+      float v_norm = v_q * v_q + v_d * v_d;
+      if (v_norm > v_max_sq) {
+        float k = sqrtf(fabsf(v_norm / v_max_sq));
+        v_q *= k;
+        v_d *= k;
+      }
+    }
+
+    if (fabsf(v_q) < 0.1) v_q = 0;
+    if (fabsf(v_d) < 0.1) v_d = 0;
+
+    FOC_generateInvClarkSVPWM(v_q, v_d, theta);
+//    setBridgeOutput(0, 0, 0, 0);
+//    setBridgeOutput(1, 0, 0, 0);
+
+    uint32_t t = HAL_GetTick();
+    dt = t - prev_t;
+    prev_t = t;
 
 
-    angle_setpoint += 0.01;
+//    HAL_Delay(1);
 
-    float v_d = 0;
-//    float v_q = 5;
-    float v_q = 3;
-    float v_alpha;
-    float v_beta;
-
-    invClark(v_d, v_q, angle_setpoint, &v_alpha, &v_beta);
-
-    SPWM(v_alpha, v_beta);
-
-    HAL_Delay(1);
-//    counter += 1;
   }
   /* USER CODE END 3 */
 }
@@ -354,7 +622,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.NbrOfConversion = 3;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
@@ -389,8 +657,17 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -678,7 +955,7 @@ static void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.DeadTime = 128;
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.BreakFilter = 0;
@@ -696,6 +973,44 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 159;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 250;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
