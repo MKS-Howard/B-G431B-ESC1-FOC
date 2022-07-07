@@ -1,0 +1,8 @@
+../Lib/FEB_math/FEB_math.h:11:21:clampf	24	static
+../Lib/FEB_math/FEB_math.h:15:21:wrapTo2Pi	16	static
+../Core/Src/foc.c:29:6:FOC_runCalibrationSequence	200	static
+../Core/Src/foc.c:127:6:FOC_updatePositionPID	32	static
+../Core/Src/foc.c:145:6:FOC_updateTorque	96	static
+../Core/Src/foc.c:212:6:FOC_setFluxAngle	32	static
+../Core/Src/foc.c:220:6:FOC_generateInvClarkSVPWM	80	static
+../Core/Src/foc.c:240:6:FOC_setBridgeOutput	32	static

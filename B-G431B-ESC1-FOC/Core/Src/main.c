@@ -31,6 +31,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define NLSM_END 0x0AU
+#define NLSM_ESC 0x0BU
+#define NLSM_ESC_END 0x1AU
+#define NLSM_ESC_ESC 0x1BU
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,6 +48,8 @@ ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
+FDCAN_HandleTypeDef hfdcan1;
+
 I2C_HandleTypeDef hi2c1;
 
 OPAMP_HandleTypeDef hopamp1;
@@ -51,6 +57,7 @@ OPAMP_HandleTypeDef hopamp2;
 OPAMP_HandleTypeDef hopamp3;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
@@ -65,12 +72,18 @@ uint16_t adc1_dma_data[3];
 uint16_t adc2_dma_data[2];
 uint16_t adc_opamp_current_offset[3];
 
+
+AS5600 encoder;
+
+
 uint32_t dt;
 
 uint16_t counter;
 
-int8_t n_pole_pairs;
+uint8_t n_pole_pairs;
 int8_t motor_direction;
+
+uint8_t foc_mode;
 
 float phase_current_measured[3];    // positive for going into phase, negative for going out of phase
 float i_q_filtered;
@@ -99,6 +112,11 @@ int32_t encoder_n_rotations;
 float input_pot;
 
 
+static FDCAN_RxHeaderTypeDef RxHeader;
+static uint8_t RxData[8];
+static FDCAN_TxHeaderTypeDef TxHeader;
+static uint8_t TxData[8];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -114,9 +132,10 @@ static void MX_DMA_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_FDCAN1_Init(void);
 /* USER CODE BEGIN PFP */
 void logStat();
-float AS5600_getPosition();
 
 /* USER CODE END PFP */
 
@@ -142,205 +161,24 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   }
 }
 
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+//  if (htim == &htim4) {
+//    logStat();
+//    FOC_updateTorque();
+//  }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim == &htim6) {
-
-    position_setpoint = input_pot * 2 * M_PI * 15;
-
-    float position_error = position_setpoint - position_measured;
-
-    float position_kp = 0.5; //30;
-
-    torque_setpoint = position_kp * position_error;
-
-    flux_setpoint = 0;
-
-    float maximum_current = 1;
-    torque_setpoint = clampf(torque_setpoint, -maximum_current, maximum_current);
-    flux_setpoint = clampf(flux_setpoint, -maximum_current, maximum_current);
-
-
-    counter += 1;
-    if (counter >= 400) {
-      logStat();
-      counter = 0;
-    }
+  if (htim == &htim4) {
+    FOC_updateTorque();
+  }
+  else if (htim == &htim6) {
+    float target_position = input_pot * 2 * M_PI * 15;
+    FOC_updatePositionPID(target_position);
   }
 }
 
-
-float AS5600_getPosition() {
-  uint8_t buf[2];
-  HAL_I2C_Mem_Read(&hi2c1, 0b0110110<<1, 0x0E, I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
-
-  const uint16_t cpr = 4096;
-  uint16_t raw_angle = ((uint16_t)buf[0] << 8) | buf[1];
-  float position_relative = ((float)raw_angle / (float)cpr) * (2*M_PI);
-
-  float delta_position = position_relative - encoder_position_prev;
-
-  if (fabsf(delta_position) > 0.8 * (2*M_PI)) {
-    encoder_n_rotations += (delta_position > 0) ? -1 : 1;
-  }
-
-  encoder_position_prev = position_relative;
-
-  return position_relative + encoder_n_rotations * (2*M_PI);
-}
-
-
-void setBridgeOutput(uint8_t enabled, float a, float b, float c) {
-  if (!enabled) {
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
-    return;
-  }
-
-  a = clampf(a, 0.0f, 0.98f);  // prevent hi-side switching bootstrap circuit loses voltage
-  b = clampf(b, 0.0f, 0.98f);
-  c = clampf(c, 0.0f, 0.98f);
-
-  uint16_t ccr_a = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * a);
-  uint16_t ccr_b = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * b);
-  uint16_t ccr_c = (uint16_t)((float)(__HAL_TIM_GET_AUTORELOAD(&htim1)+1) * c);
-
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, ccr_a);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, ccr_b);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, ccr_c);
-}
-
-
-void FOC_generateInvClarkSVPWM(float v_q, float v_d, float theta) {
-  float v_alpha = -v_q * sinf(theta) + v_d * cosf(theta);
-  float v_beta = v_q * cosf(theta) + v_d * sinf(theta);
-  float v_a = v_alpha;
-  float v_b = (-0.5 * v_alpha) + ((sqrtf(3.0f)/2.) * v_beta);
-  float v_c = (-0.5 * v_alpha) - ((sqrtf(3.0f)/2.) * v_beta);
-
-  float v_neutral = .5f * (fmaxf(fmaxf(v_a, v_b), v_c) + fminf(fminf(v_a, v_b), v_c));
-
-  phase_voltage_setpoint[0] = v_a - v_neutral;
-  phase_voltage_setpoint[1] = v_b - v_neutral;
-  phase_voltage_setpoint[2] = v_c - v_neutral;
-
-  float pwm_duty_cycle_a = .5f * ((phase_voltage_setpoint[0] / bus_voltage_measured) + 1.f);
-  float pwm_duty_cycle_b = .5f * ((phase_voltage_setpoint[1] / bus_voltage_measured) + 1.f);
-  float pwm_duty_cycle_c = .5f * ((phase_voltage_setpoint[2] / bus_voltage_measured) + 1.f);
-
-  setBridgeOutput(1, pwm_duty_cycle_a, pwm_duty_cycle_b, pwm_duty_cycle_c);
-}
-
-/**
- * set flux angle within one electrical revolution.
- *
- * @param angle_setpoint: the electrical revolution angle, in radian.
- */
-void FOC_setFluxAngle(float angle_setpoint, float voltage_setpoint) {
-  float theta = wrapTo2Pi(angle_setpoint);
-  float v_q = 0.0f;
-  float v_d = clampf(voltage_setpoint, -2, 14);
-
-  FOC_generateInvClarkSVPWM(v_q, v_d, theta);
-}
-
-void FOC_runCalibrationSequence() {
-  // calibration sequence
-  HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_SET);
-
-  // get current offset
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
-  HAL_Delay(500);
-
-  adc_opamp_current_offset[0] = adc1_dma_data[0];
-  adc_opamp_current_offset[1] = adc2_dma_data[0];
-  adc_opamp_current_offset[2] = adc2_dma_data[1];
-
-  {
-    char str[128];
-    sprintf(str, "phase current offset: %d\t%d\t%d\r\n", adc_opamp_current_offset[0], adc_opamp_current_offset[1], adc_opamp_current_offset[2]);
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
-  }
-
-  // open loop calibration
-  float flux_angle_setpoint = 0;
-  float voltage_setpoint = 1;
-
-  FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
-  HAL_Delay(500);
-
-  float start_position = AS5600_getPosition();
-
-  // move one electrical revolution forward
-  for (int16_t i=0; i<=500; i+=1) {
-    flux_angle_setpoint = (i / 500.0f) * (2*M_PI);
-    FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
-    HAL_Delay(2);
-  }
-  HAL_Delay(500);
-
-  float end_position = AS5600_getPosition();
-
-  for (int16_t i=500; i>=0; i-=1) {
-    flux_angle_setpoint = (i / 500.0f) * (2*M_PI);
-    FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
-    HAL_Delay(2);
-  }
-
-  flux_angle_setpoint = 0;
-  FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
-  HAL_Delay(500);
-
-  start_position = 0.5 * AS5600_getPosition() + 0.5 * start_position;
-  HAL_Delay(500);
-
-  // release motor
-  FOC_setFluxAngle(0, 0);
-
-
-  float delta_position = end_position - start_position;
-
-  {
-    char str[128];
-    sprintf(str, "initial encoder angle: %f\r\n", start_position);
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
-    sprintf(str, "end encoder angle: %f\r\n", end_position);
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
-    sprintf(str, "delta angle: %f\r\n", delta_position);
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
-  }
-
-
-  if (fabsf(delta_position) < 0.1) {
-    // motor did not rotate
-    HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor not rotating\r\n", strlen("ERROR: motor not rotating\r\n"), 10);
-  }
-
-  if (fabsf(fabsf(delta_position)*n_pole_pairs-(2*M_PI)) > 0.5f) {
-    HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor pole pair mismatch\r\n", strlen("ERROR: motor pole pair mismatch\r\n"), 10);
-  }
-
-
-  // set electrical angle
-  encoder_flux_angle_offset = wrapTo2Pi(start_position * n_pole_pairs);
-
-  {
-    char str[128];
-    sprintf(str, "offset angle: %f\r\n", encoder_flux_angle_offset);
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
-  }
-
-  HAL_Delay(1000);
-
-  HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_RESET);
-}
-
-void FOC_updateTorque(float i_q_setpoint, float i_d_setpoint) {
-
-//  motor_current_mA[index]= -((float)motor_current_sample_adc[index]-motor_current_input_adc_offset[index])/motor_current_input_adc_mA[index];
-}
 
 uint8_t getUserButton() {
   return HAL_GPIO_ReadPin(GPIO_BUTTON_GPIO_Port, GPIO_BUTTON_Pin) ? 0 : 1;
@@ -361,8 +199,52 @@ void logStat() {
       v_q, v_d,
       torque_setpoint, flux_setpoint,
       position_setpoint);
-  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
+  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
 }
+
+void CAN_init(void) {
+  FDCAN_FilterTypeDef sFilterConfig;
+
+  /* Configure Rx filter */
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0;
+  sFilterConfig.FilterType = FDCAN_FILTER_RANGE;
+  sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  sFilterConfig.FilterID1 = 0x000;
+  sFilterConfig.FilterID2 = 0x100;
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
+    Error_Handler();
+  }
+
+  /* Configure global filter:
+     Filter all remote frames with STD and EXT ID
+     Reject non matching frames with STD ID and EXT ID */
+  if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK) {
+    Error_Handler();
+  }
+
+
+  /* Start the FDCAN module */
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+    Error_Handler();
+  }
+
+  if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
+    Error_Handler();
+  }
+
+  /* Prepare Tx Header */
+  TxHeader.Identifier = 0;
+  TxHeader.IdType = FDCAN_STANDARD_ID;
+  TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+  TxHeader.DataLength = FDCAN_DLC_BYTES_8;
+  TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+  TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+  TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  TxHeader.MessageMarker = 0;
+}
+
 
 /* USER CODE END 0 */
 
@@ -404,8 +286,14 @@ int main(void)
   MX_ADC2_Init();
   MX_ADC1_Init();
   MX_TIM6_Init();
+  MX_TIM4_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
 
+
+  AS5600_init(&encoder, &hi2c1);
+
+  foc_mode = FOC_MODE_IDLE;
 
 //  uint8_t buffer[2];
 //  HAL_I2C_Mem_Read(&hi2c1, 0b0110110<<1, 0x08, I2C_MEMADD_SIZE_8BIT, buffer, 1, 10);
@@ -416,14 +304,14 @@ int main(void)
   n_pole_pairs = 14;
   motor_direction = 1;
 
-  encoder_flux_angle_offset = 4.815159;
+  encoder_flux_angle_offset = 1.657433;
 
   adc_opamp_current_offset[0] = 2485;
   adc_opamp_current_offset[1] = 2463;
   adc_opamp_current_offset[2] = 2484;
 
-
   // initialize
+  CAN_init();
 
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
@@ -445,6 +333,9 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_dma_data, 3);
   HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma_data, 2);
 
+//  HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_1);
+//  HAL_TIM_IC_Start(&htim4, TIM_CHANNEL_2);
+  HAL_TIM_Base_Start_IT(&htim4);
   HAL_TIM_Base_Start_IT(&htim6);
 
   // CORDIC init
@@ -460,6 +351,7 @@ int main(void)
   uint32_t prev_t = HAL_GetTick();
 
 
+  foc_mode = FOC_MODE_POSITION;
 
   /* USER CODE END 2 */
 
@@ -475,72 +367,8 @@ int main(void)
       FOC_runCalibrationSequence();
     }
 
-
-
-    position_measured = AS5600_getPosition();
-
-    float i_a = phase_current_measured[0];
-    float i_b = phase_current_measured[1];
-    float i_c = phase_current_measured[2];
-
-    float i_alpha = i_a + (cosf((2./3.) * M_PI) * i_b) + (cosf((2./3.) * M_PI) * i_c);
-    float i_beta = sinf((2./3.) * M_PI) * i_b - sinf((2./3.) * M_PI) * i_c;
-
-    i_alpha *= 2 / 3.;
-    i_beta *= 2 / 3.;
-
-
-    float theta = wrapTo2Pi((position_measured * (float)n_pole_pairs) - encoder_flux_angle_offset);
-
-    float i_q = -i_alpha * sinf(theta) + i_beta * cosf(theta);
-    float i_d = i_alpha * cosf(theta) + i_beta * sinf(theta);
-
-    const float ALPHA = 0.5;
-
-    i_q_filtered = ALPHA * i_q + (1-ALPHA) * i_q_filtered;
-    i_d_filtered = ALPHA * i_d + (1-ALPHA) * i_d_filtered;
-
-
-    uint8_t closed_loop = 1;
-
-//    float i_q_setpoint = 0;
-//    float i_d_setpoint = 0.2;
-    float i_q_setpoint = torque_setpoint;
-    float i_d_setpoint = flux_setpoint;
-
-    float i_q_error = i_q_setpoint - (closed_loop ? i_q_filtered : 0);
-    float i_d_error = i_d_setpoint - (closed_loop ? i_d_filtered : 0);
-
-    float v_q_kp = 5;
-    float v_d_kp = 5;
-
-    v_q = i_q_error * v_q_kp;  // kp = 0.02
-    v_d = i_d_error * v_d_kp;
-
-    // clamp voltage
-    if (bus_voltage_measured > 0) {
-      float v_max_sq = bus_voltage_measured * bus_voltage_measured * 1.15; // CSVPWM over modulation
-      float v_norm = v_q * v_q + v_d * v_d;
-      if (v_norm > v_max_sq) {
-        float k = sqrtf(fabsf(v_norm / v_max_sq));
-        v_q *= k;
-        v_d *= k;
-      }
-    }
-
-    if (fabsf(v_q) < 0.1) v_q = 0;
-    if (fabsf(v_d) < 0.1) v_d = 0;
-
-    FOC_generateInvClarkSVPWM(v_q, v_d, theta);
-//    setBridgeOutput(0, 0, 0, 0);
-//    setBridgeOutput(1, 0, 0, 0);
-
-    uint32_t t = HAL_GetTick();
-    dt = t - prev_t;
-    prev_t = t;
-
-
-//    HAL_Delay(1);
+    logStat();
+    HAL_Delay(10);
 
   }
   /* USER CODE END 3 */
@@ -747,6 +575,49 @@ static void MX_ADC2_Init(void)
 }
 
 /**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 1;
+  hfdcan1.Init.NominalSyncJumpWidth = 16;
+  hfdcan1.Init.NominalTimeSeg1 = 63;
+  hfdcan1.Init.NominalTimeSeg2 = 16;
+  hfdcan1.Init.DataPrescaler = 1;
+  hfdcan1.Init.DataSyncJumpWidth = 4;
+  hfdcan1.Init.DataTimeSeg1 = 5;
+  hfdcan1.Init.DataTimeSeg2 = 4;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
+
+}
+
+/**
   * @brief I2C1 Initialization Function
   * @param None
   * @retval None
@@ -762,7 +633,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x30909DEC;
+  hi2c1.Init.Timing = 0x00F07BFF;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -977,6 +848,70 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief TIM4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_SlaveConfigTypeDef sSlaveConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 159;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 999;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sSlaveConfig.SlaveMode = TIM_SLAVEMODE_RESET;
+  sSlaveConfig.InputTrigger = TIM_TS_TI1FP1;
+  sSlaveConfig.TriggerPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sSlaveConfig.TriggerPrescaler = TIM_ICPSC_DIV1;
+  sSlaveConfig.TriggerFilter = 0;
+  if (HAL_TIM_SlaveConfigSynchro(&htim4, &sSlaveConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim4, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
+  if (HAL_TIM_IC_ConfigChannel(&htim4, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+
+}
+
+/**
   * @brief TIM6 Initialization Function
   * @param None
   * @retval None
@@ -996,7 +931,7 @@ static void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 159;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 250;
+  htim6.Init.Period = 999;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -1100,12 +1035,15 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : GPIO_LED_Pin */
-  GPIO_InitStruct.Pin = GPIO_LED_Pin;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIO_CAN_TERM_GPIO_Port, GPIO_CAN_TERM_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pins : GPIO_LED_Pin GPIO_CAN_TERM_Pin */
+  GPIO_InitStruct.Pin = GPIO_LED_Pin|GPIO_CAN_TERM_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIO_LED_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : GPIO_BUTTON_Pin */
   GPIO_InitStruct.Pin = GPIO_BUTTON_Pin;

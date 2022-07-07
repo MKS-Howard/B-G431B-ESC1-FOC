@@ -1,0 +1,2 @@
+../Lib/AS5600/as5600.c:10:6:AS5600_init	16	static
+../Lib/AS5600/as5600.c:17:7:AS5600_getPosition	56	static

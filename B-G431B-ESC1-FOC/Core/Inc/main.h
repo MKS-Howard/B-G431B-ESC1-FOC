@@ -34,7 +34,12 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include "math_util.h"
+
+#include "FEB_math/FEB_math.h"
+#include "AS5600/as5600.h"
+
+#include "foc.h"
+
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -70,6 +75,8 @@ void Error_Handler(void);
 #define GPIO_LED_GPIO_Port GPIOC
 #define GPIO_BUTTON_Pin GPIO_PIN_10
 #define GPIO_BUTTON_GPIO_Port GPIOC
+#define GPIO_CAN_TERM_Pin GPIO_PIN_11
+#define GPIO_CAN_TERM_GPIO_Port GPIOC
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
