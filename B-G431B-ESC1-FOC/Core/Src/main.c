@@ -59,6 +59,7 @@ OPAMP_HandleTypeDef hopamp3;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 
 UART_HandleTypeDef huart2;
 
@@ -74,34 +75,8 @@ uint16_t adc_opamp_current_offset[3];
 
 
 AS5600 encoder;
-
-
-uint32_t dt;
-
-uint16_t counter;
-
-uint8_t n_pole_pairs;
-int8_t motor_direction;
-
-uint8_t foc_mode;
-
-float phase_current_measured[3];    // positive for going into phase, negative for going out of phase
-float i_q_filtered;
-float i_d_filtered;
-float v_q;
-float v_d;
-float v_alpha;
-float v_beta;
-float bus_voltage_measured;
-float phase_voltage_setpoint[3];
-
-float position_setpoint;
-float position_measured;
-float encoder_flux_angle_offset;
-
-float torque_setpoint;
-float flux_setpoint;
-
+FOC_Config foc_config;
+FOC_Param foc_param;
 
 
 // encoder variables
@@ -134,8 +109,11 @@ static void MX_ADC1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_FDCAN1_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
-void logStat();
+
+uint8_t getUserButton();
+void handleHostCommand();
 
 /* USER CODE END PFP */
 
@@ -148,15 +126,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     // shunt: when current flows inward phase, shunt voltage is negative; when current flows outward phase, shunt voltage is positive
     // thus we put negative sign at phase current conversion.
     if(__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
-      phase_current_measured[0] = -(float)(adc1_dma_data[0] - adc_opamp_current_offset[0]) * ADC_OPAMP_CURRENT_COEFFICIENT;
-      bus_voltage_measured = adc1_dma_data[1] / (float)ADC_RESOLUTION * 3.3 * 10.39;
-      input_pot = adc1_dma_data[2] / (float)ADC_RESOLUTION;
+      foc_param.phase_current_measured[0] = -(float)(adc1_dma_data[0] - adc_opamp_current_offset[0]) * ADC_OPAMP_CURRENT_COEFFICIENT;
+      foc_param.bus_voltage_measured = adc1_dma_data[1] / (float)ADC_RESOLUTION * 3.3 * 10.39;
+      input_pot = (adc1_dma_data[2] / (float)ADC_RESOLUTION) * 2 - 1;
     }
   }
   if (hadc == &hadc2) {
     if(__HAL_TIM_IS_TIM_COUNTING_DOWN(&htim1)) {
-      phase_current_measured[1] = -(float)(adc2_dma_data[0] - adc_opamp_current_offset[1]) * ADC_OPAMP_CURRENT_COEFFICIENT;
-      phase_current_measured[2] = -(float)(adc2_dma_data[1] - adc_opamp_current_offset[2]) * ADC_OPAMP_CURRENT_COEFFICIENT;
+      foc_param.phase_current_measured[1] = -(float)(adc2_dma_data[0] - adc_opamp_current_offset[1]) * ADC_OPAMP_CURRENT_COEFFICIENT;
+      foc_param.phase_current_measured[2] = -(float)(adc2_dma_data[1] - adc_opamp_current_offset[2]) * ADC_OPAMP_CURRENT_COEFFICIENT;
     }
   }
 }
@@ -174,32 +152,108 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     FOC_updateTorque();
   }
   else if (htim == &htim6) {
-    float target_position = input_pot * 2 * M_PI * 15;
-    FOC_updatePositionPID(target_position);
+    FOC_updatePositionVelocityPID();
   }
 }
-
 
 uint8_t getUserButton() {
   return HAL_GPIO_ReadPin(GPIO_BUTTON_GPIO_Port, GPIO_BUTTON_Pin) ? 0 : 1;
 }
 
-void logStat() {
-  char str[512];
-  sprintf(str, "%.3f\t%.3f\t%.3f\t%.3f\t%.1f\t%.5f\t%.5f\t%.5f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\r\n",
-      phase_current_measured[0],
-      phase_current_measured[1],
-      phase_current_measured[2],
-      position_measured,
-      bus_voltage_measured,
-      phase_voltage_setpoint[0],
-      phase_voltage_setpoint[1],
-      phase_voltage_setpoint[2],
-      i_q_filtered, i_d_filtered,
-      v_q, v_d,
-      torque_setpoint, flux_setpoint,
-      position_setpoint);
-  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+void handleHostCommand() {
+  char str[128];
+
+  uint8_t command = 0;
+
+  if (HAL_UART_Receive(&huart2, &command, 1, 1000) != HAL_OK) {
+    return;
+  }
+
+  if (command == '0') {  // idle mode
+    foc_config.mode = FOC_MODE_IDLE;
+    sprintf(str, "IDLE mode\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == '1') {  // position mode
+    sprintf(str, "Start Calibration\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    FOC_runCalibrationSequence();
+    sprintf(str, "Calibration Done!\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == '2') {  // torque mode
+    foc_config.mode = FOC_MODE_TORQUE;
+    sprintf(str, "TORQUE mode\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == '3') {  // velocity mode
+    foc_config.mode = FOC_MODE_VELOCITY;
+    sprintf(str, "VELOCITY mode\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == '4') {  // position mode
+    foc_config.mode = FOC_MODE_POSITION;
+    sprintf(str, "POSITION mode\n");
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == 'I') {  // log currents
+    sprintf(str, "%f\t%f\t%f\t%f\t%f\t%f\t%f\n",
+        foc_param.phase_current_measured[0],
+        foc_param.phase_current_measured[1],
+        foc_param.phase_current_measured[2],
+        foc_param.i_alpha,
+        foc_param.i_beta,
+        foc_param.i_q,
+        foc_param.i_d);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == 'V') {  // log voltages
+    sprintf(str, "%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\n",
+        foc_param.phase_voltage_setpoint[0],
+        foc_param.phase_voltage_setpoint[1],
+        foc_param.phase_voltage_setpoint[2],
+        foc_param.v_alpha,
+        foc_param.v_beta,
+        foc_param.v_q,
+        foc_param.v_d,
+        foc_param.bus_voltage_measured);
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == 'p') {  // log position
+    sprintf(str, "%f\t%f\n",
+        foc_param.position_measured,
+        foc_param.position_setpoint
+        );
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == 'v') {  // log velocity
+    sprintf(str, "%f\t%f\n",
+        foc_param.velocity_measured,
+        foc_param.velocity_setpoint
+        );
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
+  if (command == 'G') {  // log general
+    sprintf(str, "%f\t%f\t%f\t%f\t%f\t%f\n",
+        foc_param.position_measured,
+        foc_param.position_setpoint,
+        foc_param.velocity_measured,
+        foc_param.velocity_setpoint,
+        foc_param.i_q,
+        foc_param.torque_setpoint
+        );
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    return;
+  }
 }
 
 void CAN_init(void) {
@@ -288,12 +342,42 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM4_Init();
   MX_FDCAN1_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
 
 
-  AS5600_init(&encoder, &hi2c1);
+  AS5600_init(&encoder, &hi2c1, &htim7);
 
-  foc_mode = FOC_MODE_IDLE;
+  foc_config.mode = FOC_MODE_IDLE;
+  foc_config.encoder_flux_angle_offset = 1.77;
+  foc_config.n_pole_pairs = 14;
+  foc_config.motor_direction = 1;
+  foc_config.is_closed_loop = 0;
+
+  foc_config.position_kp = 0.2;
+  foc_config.position_ki = 0.001;
+  foc_config.position_ki_threshold = 100;
+  foc_config.position_kd = 0.01;
+  foc_config.position_limit_lower = 0;
+  foc_config.position_limit_upper = 0;
+
+  foc_config.velocity_kp = 0.2;
+  foc_config.velocity_ki = 0.002;
+  foc_config.velocity_ki_threshold = 100;
+  foc_config.velocity_limit_upper = 0;
+  foc_config.velocity_limit_lower = 0;
+
+  foc_config.torque_kp = 4;
+  foc_config.torque_limit_upper = 10;
+  foc_config.torque_limit_lower = -10;
+
+  foc_config.flux_kp = 4;
+
+  foc_config.current_limit = 5;
+
+  foc_config.current_sample_filter_rate = 0.1;
+
+  FOC_init(&foc_config, &foc_param, &encoder);
 
 //  uint8_t buffer[2];
 //  HAL_I2C_Mem_Read(&hi2c1, 0b0110110<<1, 0x08, I2C_MEMADD_SIZE_8BIT, buffer, 1, 10);
@@ -301,10 +385,6 @@ int main(void)
 //  buffer[0] |= (0b10 << 4);
 //  HAL_I2C_Mem_Write(&hi2c1, 0b0110110<<1, 0x08, I2C_MEMADD_SIZE_8BIT, buffer, 1, 10);
 
-  n_pole_pairs = 14;
-  motor_direction = 1;
-
-  encoder_flux_angle_offset = 1.657433;
 
   adc_opamp_current_offset[0] = 2485;
   adc_opamp_current_offset[1] = 2463;
@@ -337,39 +417,43 @@ int main(void)
 //  HAL_TIM_IC_Start(&htim4, TIM_CHANNEL_2);
   HAL_TIM_Base_Start_IT(&htim4);
   HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_Base_Start(&htim7);
+
 
   // CORDIC init
 //  API_CORDIC_Processor_Init();
 
-//  __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_1,CCRa);
-//  __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_2,CCRb); // switch b and c phases
-//  __HAL_TIM_SET_COMPARE(&htim1,TIM_CHANNEL_3,CCRc); // switch b and c phases
+  foc_param.position_setpoint = 0;
 
-
-
-  position_setpoint = 0;
-  uint32_t prev_t = HAL_GetTick();
-
-
-  foc_mode = FOC_MODE_POSITION;
-
+  HAL_UART_Transmit(&huart2, (uint8_t *)"ready\n", strlen("ready\n"), 1000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
     if (getUserButton()) {
       FOC_runCalibrationSequence();
     }
 
-    logStat();
-    HAL_Delay(10);
 
+    if (foc_config.mode == FOC_MODE_TORQUE) {
+      foc_param.torque_setpoint = input_pot * 5;
+      foc_param.velocity_setpoint = 0;
+      foc_param.position_setpoint = 0;
+    }
+    else if (foc_config.mode == FOC_MODE_VELOCITY) {
+      foc_param.velocity_setpoint = input_pot * 10;
+      foc_param.position_setpoint = 0;
+    }
+    else if (foc_config.mode == FOC_MODE_POSITION) {
+      foc_param.velocity_setpoint = 0;
+      foc_param.position_setpoint = input_pot * M_PI * 15;
+    }
+    handleHostCommand();
+    HAL_Delay(1);
   }
   /* USER CODE END 3 */
 }
@@ -931,7 +1015,7 @@ static void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 159;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 999;
+  htim6.Init.Period = 9999;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -946,6 +1030,44 @@ static void MX_TIM6_Init(void)
   /* USER CODE BEGIN TIM6_Init 2 */
 
   /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 159;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 65535;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
 
 }
 
@@ -974,7 +1096,9 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_RXOVERRUNDISABLE_INIT|UART_ADVFEATURE_DMADISABLEONERROR_INIT;
+  huart2.AdvancedInit.OverrunDisable = UART_ADVFEATURE_OVERRUN_DISABLE;
+  huart2.AdvancedInit.DMADisableonRxError = UART_ADVFEATURE_DMA_DISABLEONRXERROR;
   if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();

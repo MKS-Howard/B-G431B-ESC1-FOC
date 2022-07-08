@@ -4,31 +4,24 @@
 extern TIM_HandleTypeDef htim1;
 extern UART_HandleTypeDef huart2;
 
-extern AS5600 encoder;
+extern uint16_t adc1_dma_data[3];
+extern uint16_t adc2_dma_data[2];
+extern uint16_t adc_opamp_current_offset[3];
 
-extern float phase_voltage_setpoint[3];
-extern float bus_voltage_measured;
-extern uint8_t foc_mode;
-extern float encoder_flux_angle_offset;
-extern uint8_t n_pole_pairs;
-extern float adc1_dma_data[5];
-extern float adc2_dma_data[5];
-extern float adc_opamp_current_offset[3];
 
-extern float position_setpoint;
-extern float position_measured;
-extern float torque_setpoint;
-extern float flux_setpoint;
-extern float phase_current_measured[3];
+FOC_Config *_config;
+FOC_Param *_param;
 
-extern float i_q_filtered;
-extern float i_d_filtered;
-extern float v_q;
-extern float v_d;
+AS5600 *_encoder;
+
+void FOC_init(FOC_Config *config, FOC_Param *param, AS5600* encoder) {
+  _config = config;
+  _param = param;
+  _encoder = encoder;
+}
 
 void FOC_runCalibrationSequence() {
-  uint8_t prev_foc_mode = foc_mode;
-  foc_mode = FOC_MODE_CALIBRATION;
+  _config->mode = FOC_MODE_CALIBRATION;
   // calibration sequence
   HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_SET);
 
@@ -55,7 +48,8 @@ void FOC_runCalibrationSequence() {
   FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
   HAL_Delay(500);
 
-  float start_position = AS5600_getPosition(&encoder);
+  AS5600_update(_encoder);
+  float start_position = AS5600_getPosition(_encoder);
 
   // move one electrical revolution forward
   for (int16_t i=0; i<=500; i+=1) {
@@ -65,7 +59,8 @@ void FOC_runCalibrationSequence() {
   }
   HAL_Delay(500);
 
-  float end_position = AS5600_getPosition(&encoder);
+  AS5600_update(_encoder);
+  float end_position = AS5600_getPosition(_encoder);
 
   for (int16_t i=500; i>=0; i-=1) {
     flux_angle_setpoint = (i / 500.0f) * (2*M_PI);
@@ -77,7 +72,8 @@ void FOC_runCalibrationSequence() {
   FOC_setFluxAngle(flux_angle_setpoint, voltage_setpoint);
   HAL_Delay(500);
 
-  start_position = 0.5 * AS5600_getPosition(&encoder) + 0.5 * start_position;
+  AS5600_update(_encoder);
+  start_position = 0.5 * AS5600_getPosition(_encoder) + 0.5 * start_position;
   HAL_Delay(500);
 
   // release motor
@@ -102,106 +98,123 @@ void FOC_runCalibrationSequence() {
     HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor not rotating\r\n", strlen("ERROR: motor not rotating\r\n"), 10);
   }
 
-  if (fabsf(fabsf(delta_position)*n_pole_pairs-(2*M_PI)) > 0.5f) {
+  if (fabsf(fabsf(delta_position)*_config->n_pole_pairs-(2*M_PI)) > 0.5f) {
     HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: motor pole pair mismatch\r\n", strlen("ERROR: motor pole pair mismatch\r\n"), 10);
   }
 
 
   // set electrical angle
-  encoder_flux_angle_offset = wrapTo2Pi(start_position * n_pole_pairs);
+  _config->encoder_flux_angle_offset = wrapTo2Pi(start_position * _config->n_pole_pairs);
 
   {
     char str[128];
-    sprintf(str, "offset angle: %f\r\n", encoder_flux_angle_offset);
+    sprintf(str, "offset angle: %f\r\n", _config->encoder_flux_angle_offset);
     HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 10);
   }
 
   HAL_Delay(1000);
 
-  foc_mode = prev_foc_mode;
+  _config->mode = FOC_MODE_IDLE;
   HAL_GPIO_WritePin(GPIO_LED_GPIO_Port, GPIO_LED_Pin, GPIO_PIN_RESET);
 }
 
+void FOC_updatePositionVelocityPID() {
+  // statically update reading, assuming that the FOC torque loop has fetched from encoder
+  _param->position_measured = AS5600_getPosition(_encoder);
+  _param->velocity_measured = AS5600_getVelocity(_encoder);
+
+  if (_config->mode == FOC_MODE_POSITION) {
+    if (_config->position_limit_lower != 0 && _config->position_limit_upper != 0) {
+      _param->position_setpoint = clampf(_param->position_setpoint, _config->position_limit_lower, _config->position_limit_upper);
+    }
+
+    float position_error = _param->position_setpoint - _param->position_measured;
+    _param->position_accumulated += position_error;
+    _param->position_accumulated = clampf(_param->position_accumulated, -_config->position_ki_threshold, _config->position_ki_threshold);  // integral anti-windup
 
 
-void FOC_updatePositionPID(float target_position) {
-  const float alpha = 0.2;
-  position_setpoint = (alpha * target_position) + (1-alpha) * position_setpoint;
+    _param->torque_setpoint = (_config->position_kp * position_error)
+        + (-_config->position_kd * _param->velocity_measured)
+        + (_config->position_ki * _param->position_accumulated);
+  }
+  else if (_config->mode == FOC_MODE_VELOCITY) {
+    if (_config->velocity_limit_lower != 0 && _config->velocity_limit_upper != 0) {
+      _param->velocity_setpoint = clampf(_param->velocity_setpoint, _config->velocity_limit_lower, _config->velocity_limit_upper);
+    }
 
-  float position_error = position_setpoint - position_measured;
+    float velocity_error = _param->velocity_setpoint - _param->velocity_measured;
+    _param->velocity_accumulated += velocity_error;
+    _param->velocity_accumulated = clampf(_param->velocity_accumulated, -_config->velocity_ki_threshold, _config->velocity_ki_threshold);  // integral anti-windup
 
-  float position_kp = 0.2; //30;
+    _param->torque_setpoint = (_config->velocity_kp * velocity_error)
+        + (_config->velocity_ki * _param->velocity_accumulated);
+  }
+  // because we are using BLDC motor, desired flux will always be 0 for maximum performance
+  // so no need to do expensive computations
+  _param->flux_setpoint = 0;
+  //flux_setpoint = clampf(flux_setpoint, -_config->current_limit, _config->current_limit);
 
-  torque_setpoint = position_kp * position_error;
-
-  flux_setpoint = 0;
-
-  float maximum_current = 1;
-  torque_setpoint = clampf(torque_setpoint, -maximum_current, maximum_current);
-  flux_setpoint = clampf(flux_setpoint, -maximum_current, maximum_current);
 }
 
-
 void FOC_updateTorque() {
-  if (foc_mode == FOC_MODE_IDLE || foc_mode == FOC_MODE_CALIBRATION) {
+  if (_config->mode == FOC_MODE_IDLE) {
+    FOC_setBridgeOutput(0, 0, 0, 0);
     return;
   }
-  position_measured = AS5600_getPosition(&encoder);
+  if (_config->mode == FOC_MODE_CALIBRATION) {
+    return;
+  }
 
-  float i_a = phase_current_measured[0];
-  float i_b = phase_current_measured[1];
-  float i_c = phase_current_measured[2];
+  AS5600_update(_encoder);
+  _param->position_measured = AS5600_getPosition(_encoder);
 
-  float i_alpha = i_a + (cosf((2./3.) * M_PI) * i_b) + (cosf((2./3.) * M_PI) * i_c);
-  float i_beta = sinf((2./3.) * M_PI) * i_b - sinf((2./3.) * M_PI) * i_c;
+  _param->torque_setpoint = clampf(_param->torque_setpoint, _config->torque_limit_lower, _config->torque_limit_upper);
 
-  i_alpha *= 2 / 3.;
-  i_beta *= 2 / 3.;
+  float i_a = _param->phase_current_measured[0];
+  float i_b = _param->phase_current_measured[1];
+  float i_c = _param->phase_current_measured[2];
 
+  _param->i_alpha = i_a + (cosf((2./3.) * M_PI) * i_b) + (cosf((2./3.) * M_PI) * i_c);
+  _param->i_beta  = (sinf((2./3.) * M_PI) * i_b) - (sinf((2./3.) * M_PI) * i_c);
 
-  float theta = wrapTo2Pi((position_measured * (float)n_pole_pairs) - encoder_flux_angle_offset);
+  // match the correct current magnitude after transform
+  _param->i_alpha *= 2 / 3.;
+  _param->i_beta *= 2 / 3.;
 
-  float i_q = -i_alpha * sinf(theta) + i_beta * cosf(theta);
-  float i_d = i_alpha * cosf(theta) + i_beta * sinf(theta);
+  // convert mechanical encoder revolutions into electrical revolutions
+  float theta = wrapTo2Pi((_param->position_measured * (float)_config->n_pole_pairs) - _config->encoder_flux_angle_offset);
 
-  const float ALPHA = 0.1;
+  // TODO: replace with CORDIC
+  float sin_theta = sinf(theta);
+  float cos_theta = cosf(theta);
 
-  i_q_filtered = ALPHA * i_q + (1-ALPHA) * i_q_filtered;
-  i_d_filtered = ALPHA * i_d + (1-ALPHA) * i_d_filtered;
+  float i_q_raw= -(_param->i_alpha * sin_theta) + (_param->i_beta * cos_theta);
+  float i_d_raw =  (_param->i_alpha * cos_theta) + (_param->i_beta * sin_theta);
 
+  _param->i_q = _config->current_sample_filter_rate * i_q_raw + (1 - _config->current_sample_filter_rate) * _param->i_q;
+  _param->i_d = _config->current_sample_filter_rate * i_d_raw + (1 - _config->current_sample_filter_rate) * _param->i_d;
 
-  uint8_t closed_loop = 1;
+  float i_q_error = _param->torque_setpoint - (_config->is_closed_loop ? _param->i_q : 0);
+  float i_d_error = _param->flux_setpoint   - (_config->is_closed_loop ? _param->i_d : 0);
 
-//    float i_q_setpoint = 0.4;
-//    float i_d_setpoint = 0;
-  float i_q_setpoint = torque_setpoint;
-  float i_d_setpoint = flux_setpoint;
+  i_q_error = clampf(i_q_error, -_config->current_limit, _config->current_limit);
+  i_d_error = clampf(i_d_error, -_config->current_limit, _config->current_limit);
 
-  float i_q_error = i_q_setpoint - (closed_loop ? i_q_filtered : 0);
-  float i_d_error = i_d_setpoint - (closed_loop ? i_d_filtered : 0);
-
-  float v_q_kp = 5;
-  float v_d_kp = 5;
-
-  v_q = i_q_error * v_q_kp;  // kp = 0.02
-  v_d = i_d_error * v_d_kp;
+  _param->v_q = i_q_error * _config->torque_kp;  // kp = 0.02
+  _param->v_d = i_d_error * _config->flux_kp;
 
   // clamp voltage
-  if (bus_voltage_measured > 0) {
-    float v_max_sq = bus_voltage_measured * bus_voltage_measured * 1.15; // CSVPWM over modulation
-    float v_norm = v_q * v_q + v_d * v_d;
+  if (_param->bus_voltage_measured > 0) {
+    float v_max_sq = _param->bus_voltage_measured * _param->bus_voltage_measured * 1.15; // CSVPWM over modulation
+    float v_norm = _param->v_q * _param->v_q + _param->v_d * _param->v_d;
     if (v_norm > v_max_sq) {
       float k = sqrtf(fabsf(v_norm / v_max_sq));
-      v_q *= k;
-      v_d *= k;
+      _param->v_q *= k;
+      _param->v_d *= k;
     }
   }
 
-//    if (fabsf(v_q) < 0.1) v_q = 0;
-//    if (fabsf(v_d) < 0.1) v_d = 0;
-
-  FOC_generateInvClarkSVPWM(v_q, v_d, theta);
-
+  FOC_generateInvClarkSVPWM(_param->v_q, _param->v_d, sin_theta, cos_theta);
 }
 
 /**
@@ -211,28 +224,31 @@ void FOC_updateTorque() {
  */
 void FOC_setFluxAngle(float angle_setpoint, float voltage_setpoint) {
   float theta = wrapTo2Pi(angle_setpoint);
+  float sin_theta = sinf(theta);
+  float cos_theta = cosf(theta);
   float v_q = 0.0f;
   float v_d = clampf(voltage_setpoint, -2, 14);
 
-  FOC_generateInvClarkSVPWM(v_q, v_d, theta);
+  FOC_generateInvClarkSVPWM(v_q, v_d, sin_theta, cos_theta);
 }
 
-void FOC_generateInvClarkSVPWM(float v_q, float v_d, float theta) {
-  float v_alpha = -v_q * sinf(theta) + v_d * cosf(theta);
-  float v_beta = v_q * cosf(theta) + v_d * sinf(theta);
-  float v_a = v_alpha;
-  float v_b = (-0.5 * v_alpha) + ((sqrtf(3.0f)/2.) * v_beta);
-  float v_c = (-0.5 * v_alpha) - ((sqrtf(3.0f)/2.) * v_beta);
+void FOC_generateInvClarkSVPWM(float v_q, float v_d, float sin_theta, float cos_theta) {
+  _param->v_alpha = -v_q * sin_theta + v_d * cos_theta;
+  _param->v_beta  =  v_q * cos_theta + v_d * sin_theta;
 
-  float v_neutral = .5f * (fmaxf(fmaxf(v_a, v_b), v_c) + fminf(fminf(v_a, v_b), v_c));
+  float v_a = _param->v_alpha;
+  float v_b = (-.5 * _param->v_alpha) + ((sqrtf(3.)/2.) * _param->v_beta);
+  float v_c = (-.5 * _param->v_alpha) - ((sqrtf(3.)/2.) * _param->v_beta);
 
-  phase_voltage_setpoint[0] = v_a - v_neutral;
-  phase_voltage_setpoint[1] = v_b - v_neutral;
-  phase_voltage_setpoint[2] = v_c - v_neutral;
+  float v_neutral = .5 * (fmaxf(fmaxf(v_a, v_b), v_c) + fminf(fminf(v_a, v_b), v_c));
 
-  float pwm_duty_cycle_a = .5f * ((phase_voltage_setpoint[0] / bus_voltage_measured) + 1.f);
-  float pwm_duty_cycle_b = .5f * ((phase_voltage_setpoint[1] / bus_voltage_measured) + 1.f);
-  float pwm_duty_cycle_c = .5f * ((phase_voltage_setpoint[2] / bus_voltage_measured) + 1.f);
+  _param->phase_voltage_setpoint[0] = v_a - v_neutral;
+  _param->phase_voltage_setpoint[1] = v_b - v_neutral;
+  _param->phase_voltage_setpoint[2] = v_c - v_neutral;
+
+  float pwm_duty_cycle_a = .5f * ((_param->phase_voltage_setpoint[0] / _param->bus_voltage_measured) + 1.f);
+  float pwm_duty_cycle_b = .5f * ((_param->phase_voltage_setpoint[1] / _param->bus_voltage_measured) + 1.f);
+  float pwm_duty_cycle_c = .5f * ((_param->phase_voltage_setpoint[2] / _param->bus_voltage_measured) + 1.f);
 
   FOC_setBridgeOutput(1, pwm_duty_cycle_a, pwm_duty_cycle_b, pwm_duty_cycle_c);
 }

@@ -1,8 +1,11 @@
 ../Lib/FEB_math/FEB_math.h:11:21:clampf	24	static
 ../Lib/FEB_math/FEB_math.h:15:21:wrapTo2Pi	16	static
-../Core/Src/foc.c:29:6:FOC_runCalibrationSequence	200	static
-../Core/Src/foc.c:127:6:FOC_updatePositionPID	32	static
-../Core/Src/foc.c:145:6:FOC_updateTorque	96	static
-../Core/Src/foc.c:212:6:FOC_setFluxAngle	32	static
-../Core/Src/foc.c:220:6:FOC_generateInvClarkSVPWM	80	static
-../Core/Src/foc.c:240:6:FOC_setBridgeOutput	32	static
+../Lib/AS5600/as5600.h:28:21:AS5600_getPosition	16	static
+../Lib/AS5600/as5600.h:32:21:AS5600_getVelocity	16	static
+../Core/Src/foc.c:17:6:FOC_init	24	static
+../Core/Src/foc.c:23:6:FOC_runCalibrationSequence	176	static
+../Core/Src/foc.c:121:6:FOC_updatePositionVelocityPID	24	static
+../Core/Src/foc.c:159:6:FOC_updateTorque	72	static
+../Core/Src/foc.c:225:6:FOC_setFluxAngle	40	static
+../Core/Src/foc.c:235:6:FOC_generateInvClarkSVPWM	72	static
+../Core/Src/foc.c:256:6:FOC_setBridgeOutput	32	static
